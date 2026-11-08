@@ -190,6 +190,45 @@ app.all('/send', requireSecret, async (req, res) => {
   }
 });
 
+// Envío en partes, para mensajes largos (la herramienta web de Claude limita el largo de la URL).
+//   /c?k=KEY&b=LOTE&n=1&t=texto   guarda la parte n del lote
+//   /f?k=KEY&b=LOTE               une las partes en orden y manda el mensaje
+const batches = new Map();
+const shortSecret = (req, res, next) => {
+  if (!ADMIN_SECRET || param(req, 'k') !== ADMIN_SECRET) return res.status(401).send('No autorizado');
+  res.set('Cache-Control', 'no-store');
+  next();
+};
+
+app.all('/c', shortSecret, (req, res) => {
+  const b = String(param(req, 'b') || '');
+  const n = Number(param(req, 'n'));
+  const t = param(req, 't');
+  if (!b || !Number.isInteger(n) || t === undefined) return res.status(400).send('Faltan b, n o t');
+  if (!batches.has(b)) batches.set(b, { parts: new Map(), at: Date.now() });
+  batches.get(b).parts.set(n, String(t));
+  res.type('text/plain').send(`OK parte ${n} del lote ${b} (${batches.get(b).parts.size} partes)`);
+});
+
+app.all('/f', shortSecret, async (req, res) => {
+  const b = String(param(req, 'b') || '');
+  const batch = batches.get(b);
+  if (!batch) return res.status(404).send(`No existe el lote ${b}`);
+  const text = [...batch.parts.entries()].sort((x, y) => x[0] - y[0]).map(([, t]) => t).join('');
+  try {
+    await sendToOwner(text);
+    batches.delete(b);
+    res.type('text/plain').send(`ENVIADO OK lote ${b}: ${batch.parts.size} partes`);
+  } catch (err) {
+    res.status(503).type('text/plain').send(`NO ENVIADO: ${err.message}`);
+  }
+});
+
+// Limpia lotes abandonados cada hora.
+setInterval(() => {
+  for (const [b, v] of batches) if (Date.now() - v.at > 3 * 3600e3) batches.delete(b);
+}, 3600e3);
+
 app.get('/qr', requireSecret, async (_req, res) => {
   const head = '<meta name="viewport" content="width=device-width"><meta http-equiv="refresh" content="10">';
   const style = 'font-family:system-ui;text-align:center;padding:24px';
