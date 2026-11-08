@@ -1,0 +1,22 @@
+{
+  "name": "secretaria-bot",
+  "version": "1.0.0",
+  "description": "Secretaria de eventos de Tomi por WhatsApp (Baileys + Claude)",
+  "type": "module",
+  "main": "src/index.js",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "start": "node src/index.js"
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "^1.6.0",
+    "@whiskeysockets/baileys": "7.0.0-rc14",
+    "express": "^4.21.2",
+    "googleapis": "^189.0.0",
+    "node-cron": "^3.0.3",
+    "pino": "^9.6.0",
+    "qrcode": "^1.5.4"
+  }
+}
