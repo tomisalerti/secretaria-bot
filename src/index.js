@@ -245,6 +245,16 @@ setInterval(() => {
   for (const [b, v] of batches) if (Date.now() - v.at > 3 * 3600e3) batches.delete(b);
 }, 3600e3);
 
+// El celular de Tomi (Atajo de iPhone u OwnTracks) manda la ubicación acá.
+app.all('/setloc', requireSecret, (req, res) => {
+  const body = req.body || {};
+  const lat = Number(param(req, 'lat') ?? body.lat);
+  const lon = Number(param(req, 'lon') ?? body.lon);
+  if (!Number.isFinite(lat) || !Number.isFinite(lon)) return res.status(400).send('Faltan lat y lon');
+  writeJson('ubicacion.json', { lat, lon, nombre: param(req, 'name') || null, en_vivo: true, at: new Date().toISOString() });
+  res.type('text/plain').send('UBICACION_GUARDADA');
+});
+
 // Última ubicación que compartió Tomi por WhatsApp.
 app.all('/loc', requireSecret, (_req, res) => {
   const u = readJson('ubicacion.json', null);
@@ -298,6 +308,86 @@ app.all('/clima', requireSecret, async (_req, res) => {
     );
   } catch (err) {
     res.status(502).type('text/plain').send(`ERROR_CLIMA: ${err.message}`);
+  }
+});
+
+// ---------------- Impact (ventas de campañas de afiliados) ----------------
+const IMPACT_SID = process.env.IMPACT_SID;
+const IMPACT_TOKEN = process.env.IMPACT_TOKEN;
+
+async function impactGet(path) {
+  const url = `https://api.impact.com/Mediapartners/${IMPACT_SID}/${path}`;
+  const r = await fetch(url, {
+    headers: {
+      Accept: 'application/json',
+      Authorization: 'Basic ' + Buffer.from(`${IMPACT_SID}:${IMPACT_TOKEN}`).toString('base64'),
+    },
+    signal: AbortSignal.timeout(20000),
+  });
+  const body = await r.text();
+  if (!r.ok) throw new Error(`Impact ${r.status}: ${body.slice(0, 300)}`);
+  return JSON.parse(body);
+}
+
+const num = (v) => Number(String(v ?? 0).replace(/[^0-9.-]/g, '')) || 0;
+
+async function impactActions(days) {
+  const out = [];
+  const end = new Date();
+  for (let off = 0; off < days; off += 30) {
+    const to = new Date(end.getTime() - off * 864e5);
+    const from = new Date(to.getTime() - Math.min(30, days - off) * 864e5);
+    let page = 1;
+    let pages = 1;
+    do {
+      const qs = new URLSearchParams({
+        ActionDateStart: from.toISOString().slice(0, 19) + 'Z',
+        ActionDateEnd: to.toISOString().slice(0, 19) + 'Z',
+        PageSize: '1000',
+        Page: String(page),
+      });
+      const j = await impactGet(`Actions?${qs}`);
+      out.push(...(j.Actions || []));
+      pages = Number(j['@numpages'] || 1);
+      page++;
+    } while (page <= pages);
+  }
+  return out;
+}
+
+app.all('/impact', requireSecret, async (req, res) => {
+  if (!IMPACT_SID || !IMPACT_TOKEN) return res.type('text/plain').send('IMPACT_NO_CONFIGURADO');
+  try {
+    const filtro = String(param(req, 'campana') || 'holafly').toLowerCase();
+    const all = await impactActions(365);
+    const actions = all.filter(
+      (a) => filtro === 'todas' || String(a.CampaignName || '').toLowerCase().includes(filtro)
+    );
+    const valid = actions.filter((a) => !/REVERSED|REJECTED/i.test(a.State || ''));
+    const seen = new Set(readJson('impact-seen.json', []));
+    const nuevas = valid.filter((a) => !seen.has(String(a.Id)));
+    const sum = (list, f) => list.reduce((s, a) => s + num(a[f]), 0);
+    const cur = valid[0]?.Currency || 'USD';
+    if (param(req, 'mark') === '1') writeJson('impact-seen.json', valid.map((a) => String(a.Id)));
+    const lines = [
+      `CAMPANA_FILTRO: ${filtro}`,
+      `MONEDA: ${cur}`,
+      `VENTAS_ULTIMO_ANO: ${valid.length}`,
+      `COMISION_ULTIMO_ANO: ${sum(valid, 'Payout').toFixed(2)}`,
+      `REVENUE_ULTIMO_ANO: ${sum(valid, 'Amount').toFixed(2)}`,
+      `VENTAS_NUEVAS_DESDE_ULTIMO_AVISO: ${nuevas.length}`,
+      `COMISION_NUEVA: ${sum(nuevas, 'Payout').toFixed(2)}`,
+      `REVENUE_NUEVO: ${sum(nuevas, 'Amount').toFixed(2)}`,
+      `PRIMER_AVISO: ${seen.size === 0 ? 'si (todas cuentan como nuevas)' : 'no'}`,
+    ];
+    if (param(req, 'debug') === '1') {
+      lines.push(`ACCIONES_TOTALES_TODAS_LAS_CAMPANAS: ${all.length}`);
+      lines.push(`CAMPANAS: ${[...new Set(all.map((a) => a.CampaignName))].join(' | ')}`);
+      if (all[0]) lines.push(`EJEMPLO: ${JSON.stringify(all[0]).slice(0, 800)}`);
+    }
+    res.type('text/plain').send(lines.join('\n'));
+  } catch (err) {
+    res.status(502).type('text/plain').send(`ERROR_IMPACT: ${err.message}`);
   }
 });
 
