@@ -254,6 +254,53 @@ app.all('/loc', requireSecret, (_req, res) => {
   );
 });
 
+// Clima en la última ubicación compartida (o Montevideo si no hay o es vieja).
+const WMO = {
+  0: 'despejado', 1: 'mayormente despejado', 2: 'parcialmente nublado', 3: 'nublado',
+  45: 'niebla', 48: 'niebla', 51: 'llovizna débil', 53: 'llovizna', 55: 'llovizna intensa',
+  61: 'lluvia débil', 63: 'lluvia', 65: 'lluvia fuerte', 71: 'nieve débil', 73: 'nieve', 75: 'nieve fuerte',
+  80: 'chaparrones', 81: 'chaparrones', 82: 'chaparrones fuertes', 95: 'tormenta', 96: 'tormenta con granizo', 99: 'tormenta con granizo',
+};
+
+app.all('/clima', requireSecret, async (_req, res) => {
+  try {
+    const u = readJson('ubicacion.json', null);
+    const fresh = u && Date.now() - new Date(u.at).getTime() < 36 * 3600e3;
+    const lat = fresh ? u.lat : -34.9011;
+    const lon = fresh ? u.lon : -56.1645;
+    let lugar = fresh ? u.nombre : 'Montevideo, Uruguay';
+    if (fresh && !lugar) {
+      const g = await fetch(
+        `https://nominatim.openstreetmap.org/reverse?lat=${lat}&lon=${lon}&format=json&zoom=10&accept-language=es`,
+        { headers: { 'User-Agent': 'secretaria-bot (tomisalerti.com)' }, signal: AbortSignal.timeout(10000) }
+      ).then((r) => r.json());
+      const a = g.address || {};
+      lugar = [a.city || a.town || a.village || a.county || a.state, a.country].filter(Boolean).join(', ') || g.display_name;
+    }
+    const w = await fetch(
+      `https://api.open-meteo.com/v1/forecast?latitude=${lat}&longitude=${lon}&current=temperature_2m,weather_code` +
+        `&hourly=precipitation_probability,weather_code&daily=temperature_2m_max,temperature_2m_min,precipitation_probability_max,weather_code` +
+        `&timezone=auto&forecast_days=1`,
+      { signal: AbortSignal.timeout(10000) }
+    ).then((r) => r.json());
+    const h = w.hourly;
+    const tramo = (from, to) => {
+      const probs = h.precipitation_probability.slice(from, to);
+      return Math.max(...probs);
+    };
+    res.type('text/plain').send(
+      [
+        `UBICACION: ${lugar}${fresh ? (u.en_vivo ? ' (ubicación en tiempo real)' : ' (última ubicación compartida)') : ' (por defecto: no compartió ubicación en las últimas 36 h)'}`,
+        `TEMPERATURA_AHORA: ${Math.round(w.current.temperature_2m)} °C, ${WMO[w.current.weather_code] || 'código ' + w.current.weather_code}`,
+        `HOY: máxima ${Math.round(w.daily.temperature_2m_max[0])} °C, mínima ${Math.round(w.daily.temperature_2m_min[0])} °C, ${WMO[w.daily.weather_code[0]] || ''}`,
+        `PROBABILIDAD_DE_LLUVIA: mañana (6-12 h) ${tramo(6, 12)}%, tarde (12-19 h) ${tramo(12, 19)}%, noche (19-24 h) ${tramo(19, 24)}%`,
+      ].join('\n')
+    );
+  } catch (err) {
+    res.status(502).type('text/plain').send(`ERROR_CLIMA: ${err.message}`);
+  }
+});
+
 app.get('/qr', requireSecret, async (_req, res) => {
   const head = '<meta name="viewport" content="width=device-width"><meta http-equiv="refresh" content="10">';
   const style = 'font-family:system-ui;text-align:center;padding:24px';
