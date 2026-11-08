@@ -1,28 +1,25 @@
-# Secretaria de eventos (WhatsApp)
+# Secretaria de eventos — cartero de WhatsApp
 
-Bot de WhatsApp para Tomi: busca eventos, manda un resumen diario y ejecuta pedidos (agendar en Google Calendar, preparar y enviar mails desde Gmail). Usa Baileys (WhatsApp Web no oficial) y la API de Claude. Corre en Railway con un volumen en `/data`.
+Servidor que conecta el número alternativo de WhatsApp de Tomi (Baileys, vinculado como dispositivo) y hace de cartero:
+
+- Guarda en una bandeja los mensajes que Tomi le escribe y le contesta un acuse de recibo.
+- Manda por WhatsApp a Tomi lo que le pida la secretaria (Claude, con tareas programadas en claude.ai que revisan la bandeja cada hora y mandan el resumen diario de eventos).
+
+No usa ninguna API de IA paga. Corre en Railway con un volumen en `/data`.
 
 ## Variables de entorno
 
 | Variable | Qué es |
 |---|---|
-| `ANTHROPIC_API_KEY` | API key de console.anthropic.com |
-| `OWNER_NUMBER` | Número principal de Tomi, solo dígitos con código de país (ej. `59899123456`). Solo se le responde a ese número. |
-| `ADMIN_SECRET` | Clave para abrir `/qr`, `/google/auth` y `/digest` |
-| `PUBLIC_URL` | URL pública del servicio en Railway |
-| `GOOGLE_CLIENT_ID` / `GOOGLE_CLIENT_SECRET` | Cliente OAuth (tipo "Aplicación web") con redirect `PUBLIC_URL/google/callback` |
-| `DATA_DIR` | `/data` (volumen) |
+| `OWNER_NUMBER` | Número principal de Tomi, solo dígitos con código de país (ej. `59899123456`). Solo se aceptan mensajes de ese número. |
+| `ADMIN_SECRET` | Clave requerida en todas las rutas (`?key=`) |
+| `DATA_DIR` | `/data` |
 | `TZ` | `America/Montevideo` |
-| `MODEL` | Opcional, por defecto `claude-sonnet-5-5` |
-| `DIGEST_CRON` | Opcional, por defecto `40 10 * * *` (10:40) |
+| `ACK_TEXT` | Opcional: texto del acuse de recibo |
 
-## Rutas
+## Rutas (GET o POST, todas con `?key=ADMIN_SECRET`)
 
-- `GET /` estado
-- `GET /qr?key=ADMIN_SECRET` QR para vincular el número alternativo
-- `GET /google/auth?key=ADMIN_SECRET` conectar Gmail y Calendar
-- `POST /digest?key=ADMIN_SECRET` forzar el resumen diario
-
-## Ajustes
-
-Perfil, fuentes y reglas de la secretaria: `src/prompt.js`. Las notas que guarda la secretaria quedan en `/data/notas.md`.
+- `/qr` QR para vincular el número alternativo
+- `/inbox` mensajes nuevos de Tomi (los marca como leídos; `&peek=1` para no marcarlos)
+- `/history` últimos 30 mensajes de la conversación
+- `/send?text=...` manda un WhatsApp a Tomi

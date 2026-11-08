@@ -1,6 +1,7 @@
-// Secretaria de eventos por WhatsApp: servidor web + conexión de WhatsApp + resumen diario.
+// "Cartero" de WhatsApp para la secretaria de eventos de Tomi.
+// Recibe los mensajes de Tomi en el número alternativo, los guarda en una bandeja,
+// y manda por WhatsApp lo que la secretaria (Claude, con tareas programadas) le indique.
 import express from 'express';
-import cron from 'node-cron';
 import QRCode from 'qrcode';
 import pino from 'pino';
 import fs from 'node:fs';
@@ -12,10 +13,7 @@ import {
   Browsers,
   isJidGroup,
 } from '@whiskeysockets/baileys';
-import { runAgent } from './agent.js';
-import { DIGEST_PROMPT } from './prompt.js';
-import { appendHistory, dataPath } from './store.js';
-import { googleAuthUrl, handleGoogleCallback, googleConnected } from './google.js';
+import { readJson, writeJson, dataPath } from './store.js';
 
 const log = pino({ level: process.env.LOG_LEVEL || 'info' });
 const PORT = process.env.PORT || 3000;
@@ -24,53 +22,56 @@ const ADMIN_SECRET = process.env.ADMIN_SECRET;
 const OWNER = (process.env.OWNER_NUMBER || '').replace(/\D/g, ''); // ej. 59899123456
 const OWNER_JID = `${OWNER}@s.whatsapp.net`;
 const AUTH_DIR = dataPath('wa-auth');
+const ACK_TEXT =
+  process.env.ACK_TEXT ||
+  '📥 Anotado. Lo veo en la próxima revisión (cada hora en punto, de 8 a 23) y te respondo por acá. Si es urgente, pedímelo en la app de Claude.';
 
-if (!ADMIN_SECRET || !OWNER) {
-  log.error('Faltan ADMIN_SECRET u OWNER_NUMBER en las variables de entorno.');
-}
+if (!ADMIN_SECRET || !OWNER) log.error('Faltan ADMIN_SECRET u OWNER_NUMBER en las variables de entorno.');
 
 let sock = null;
 let lastQr = null;
 let connected = false;
-let ownerLid = null; // WhatsApp a veces identifica al contacto con un LID en vez del número
+let ownerChat = readJson('owner-chat.json', null); // jid real del chat con Tomi (puede ser un LID)
+
+// ---------------- Bandeja ----------------
+// inbox.json: [{ id, at, text, status: 'nuevo' | 'leido' }]
+const INBOX = 'inbox.json';
+const OUTBOX = 'outbox.json';
+
+function addToInbox(id, text) {
+  const inbox = readJson(INBOX, []);
+  inbox.push({ id, at: new Date().toISOString(), text, status: 'nuevo' });
+  writeJson(INBOX, inbox.slice(-200));
+}
+
+function logOutgoing(text) {
+  const out = readJson(OUTBOX, []);
+  out.push({ at: new Date().toISOString(), text });
+  writeJson(OUTBOX, out.slice(-100));
+}
+
+const local = (iso) => new Date(iso).toLocaleString('es-UY', { timeZone: TZ });
 
 // ---------------- WhatsApp ----------------
-function numberOf(jid) {
-  return (jid || '').split('@')[0].split(':')[0];
-}
+const numberOf = (jid) => (jid || '').split('@')[0].split(':')[0];
 
 function isOwner(key) {
   const candidates = [key.remoteJid, key.remoteJidAlt, key.participant, key.participantAlt];
-  if (candidates.some((j) => j && j.endsWith('@s.whatsapp.net') && numberOf(j) === OWNER)) {
-    if (key.remoteJid?.endsWith('@lid')) ownerLid = key.remoteJid;
-    return true;
-  }
-  return Boolean(ownerLid && key.remoteJid === ownerLid);
+  if (candidates.some((j) => j && j.endsWith('@s.whatsapp.net') && numberOf(j) === OWNER)) return true;
+  return Boolean(ownerChat && key.remoteJid === ownerChat);
 }
 
-async function sendToOwner(text, jid = OWNER_JID) {
+function textOf(m) {
+  if (!m) return null;
+  return m.conversation || m.extendedTextMessage?.text || m.imageMessage?.caption || m.videoMessage?.caption || null;
+}
+
+async function sendToOwner(text) {
   if (!sock || !connected) throw new Error('WhatsApp no está conectado');
-  // WhatsApp corta mensajes muy largos: partir en trozos de ~3500 caracteres.
+  const jid = ownerChat || OWNER_JID;
   const chunks = text.match(/[\s\S]{1,3500}(?=\n|$)|[\s\S]{1,3500}/g) || [text];
   for (const c of chunks) await sock.sendMessage(jid, { text: c });
-}
-
-function textOf(message) {
-  if (!message) return null;
-  return (
-    message.conversation ||
-    message.extendedTextMessage?.text ||
-    message.imageMessage?.caption ||
-    message.videoMessage?.caption ||
-    null
-  );
-}
-
-// Una sola tarea a la vez, para que no se pisen pedidos.
-let queue = Promise.resolve();
-function enqueue(fn) {
-  queue = queue.then(fn).catch((err) => log.error({ err }, 'Error en tarea'));
-  return queue;
+  logOutgoing(text);
 }
 
 async function handleIncoming(msg) {
@@ -80,26 +81,18 @@ async function handleIncoming(msg) {
     log.info({ from: key.remoteJid, alt: key.remoteJidAlt }, 'Mensaje ignorado (no es de Tomi)');
     return;
   }
+  if (ownerChat !== key.remoteJid) {
+    ownerChat = key.remoteJid;
+    writeJson('owner-chat.json', ownerChat);
+  }
   const text = textOf(msg.message);
-  const replyJid = key.remoteJid;
   if (!text) {
-    await sock.sendMessage(replyJid, { text: 'Por ahora solo leo texto 🙏 (audios y fotos sin texto todavía no).' });
+    await sock.sendMessage(key.remoteJid, { text: 'Por ahora solo leo texto 🙏 (los audios y fotos sin texto todavía no).' });
     return;
   }
-  enqueue(async () => {
-    try {
-      await sock.sendPresenceUpdate('composing', replyJid);
-      const answer = await runAgent(text);
-      appendHistory('user', text);
-      appendHistory('assistant', answer);
-      await sendToOwner(answer || '(sin respuesta)', replyJid);
-    } catch (err) {
-      log.error({ err }, 'Error respondiendo');
-      await sock.sendMessage(replyJid, { text: `Tuve un error: ${err.message}` });
-    } finally {
-      await sock.sendPresenceUpdate('paused', replyJid).catch(() => {});
-    }
-  });
+  const hadPending = readJson(INBOX, []).some((m) => m.status === 'nuevo');
+  addToInbox(key.id, text);
+  if (!hadPending) await sock.sendMessage(key.remoteJid, { text: ACK_TEXT });
 }
 
 async function startWhatsApp() {
@@ -113,9 +106,7 @@ async function startWhatsApp() {
     markOnlineOnConnect: false,
     syncFullHistory: false,
   });
-
   sock.ev.on('creds.update', saveCreds);
-
   sock.ev.on('connection.update', ({ connection, lastDisconnect, qr }) => {
     if (qr) {
       lastQr = qr;
@@ -138,34 +129,65 @@ async function startWhatsApp() {
       setTimeout(startWhatsApp, 3000);
     }
   });
-
   sock.ev.on('messages.upsert', async ({ messages, type }) => {
     if (type !== 'notify') return;
-    for (const m of messages) await handleIncoming(m).catch((err) => log.error({ err }));
+    for (const m of messages) await handleIncoming(m).catch((err) => log.error({ err }, 'Error procesando mensaje'));
   });
 }
 
-// ---------------- Resumen diario ----------------
-async function runDigest() {
-  log.info('Corriendo resumen diario');
-  const answer = await runAgent(DIGEST_PROMPT);
-  appendHistory('user', '[resumen diario automático]');
-  appendHistory('assistant', answer);
-  await sendToOwner(answer, ownerLid || OWNER_JID);
-}
-
-cron.schedule(process.env.DIGEST_CRON || '40 10 * * *', () => enqueue(runDigest), { timezone: TZ });
-
 // ---------------- Servidor web ----------------
+// Todas las rutas aceptan GET (para que Claude pueda usarlas con su herramienta de lectura web)
+// y POST con JSON. Todas requieren ?key=ADMIN_SECRET.
 const app = express();
+app.use(express.json({ limit: '1mb' }));
+app.use(express.urlencoded({ extended: true }));
+
+const param = (req, name) => req.body?.[name] ?? req.query[name];
 
 function requireSecret(req, res, next) {
-  if (!ADMIN_SECRET || req.query.key !== ADMIN_SECRET) return res.status(401).send('No autorizado');
+  if (!ADMIN_SECRET || param(req, 'key') !== ADMIN_SECRET) return res.status(401).send('No autorizado');
+  res.set('Cache-Control', 'no-store');
   next();
 }
 
-app.get('/', (_req, res) => {
-  res.json({ ok: true, whatsapp: connected ? 'conectado' : 'desconectado', google: googleConnected() });
+app.get('/', (_req, res) => res.json({ ok: true, whatsapp: connected ? 'conectado' : 'desconectado' }));
+
+// Mensajes nuevos de Tomi. Los marca como leídos al devolverlos.
+app.all('/inbox', requireSecret, (req, res) => {
+  const inbox = readJson(INBOX, []);
+  const nuevos = inbox.filter((m) => m.status === 'nuevo');
+  if (param(req, 'peek') !== '1') {
+    for (const m of inbox) if (m.status === 'nuevo') m.status = 'leido';
+    writeJson(INBOX, inbox);
+  }
+  const lines = nuevos.map((m) => `[${local(m.at)}] ${m.text}`);
+  res.type('text/plain').send(
+    `WHATSAPP: ${connected ? 'conectado' : 'DESCONECTADO'}\nMENSAJES_NUEVOS: ${nuevos.length}\n\n` +
+      (lines.join('\n\n') || '(no hay mensajes nuevos)')
+  );
+});
+
+// Conversación reciente (mensajes de Tomi y respuestas enviadas), para tener contexto.
+app.all('/history', requireSecret, (_req, res) => {
+  const items = [
+    ...readJson(INBOX, []).map((m) => ({ at: m.at, who: 'Tomi', text: m.text })),
+    ...readJson(OUTBOX, []).map((m) => ({ at: m.at, who: 'Secretaria', text: m.text })),
+  ]
+    .sort((a, b) => a.at.localeCompare(b.at))
+    .slice(-30);
+  res.type('text/plain').send(items.map((i) => `[${local(i.at)}] ${i.who}: ${i.text}`).join('\n\n') || '(vacío)');
+});
+
+// Enviar un WhatsApp a Tomi.
+app.all('/send', requireSecret, async (req, res) => {
+  const text = param(req, 'text');
+  if (!text) return res.status(400).send('Falta text');
+  try {
+    await sendToOwner(String(text));
+    res.type('text/plain').send(`ENVIADO OK (${String(text).length} caracteres)`);
+  } catch (err) {
+    res.status(503).type('text/plain').send(`NO ENVIADO: ${err.message}`);
+  }
 });
 
 app.get('/qr', requireSecret, async (_req, res) => {
@@ -179,29 +201,6 @@ app.get('/qr', requireSecret, async (_req, res) => {
       `<p>WhatsApp → Dispositivos vinculados → Vincular un dispositivo</p><img src="${img}" alt="QR"/>` +
       `<p>La página se actualiza cada 10 segundos.</p></div>`
   );
-});
-
-app.get('/google/auth', requireSecret, (_req, res) => {
-  try {
-    res.redirect(googleAuthUrl());
-  } catch (err) {
-    res.status(500).send(err.message);
-  }
-});
-
-app.get('/google/callback', async (req, res) => {
-  if (!ADMIN_SECRET || req.query.state !== ADMIN_SECRET) return res.status(401).send('No autorizado');
-  try {
-    await handleGoogleCallback(req.query.code);
-    res.send('<div style="font-family:system-ui;padding:24px"><h2>✅ Google conectado</h2><p>Ya podés cerrar esta pestaña.</p></div>');
-  } catch (err) {
-    res.status(500).send(`Error: ${err.message}`);
-  }
-});
-
-app.post('/digest', requireSecret, (_req, res) => {
-  enqueue(runDigest);
-  res.send('Resumen en camino');
 });
 
 app.listen(PORT, () => log.info(`Servidor en puerto ${PORT}`));
