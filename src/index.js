@@ -85,6 +85,19 @@ async function handleIncoming(msg) {
     ownerChat = key.remoteJid;
     writeJson('owner-chat.json', ownerChat);
   }
+  // Ubicación compartida (fija o en tiempo real): se guarda para el mensaje de buen día.
+  const loc = msg.message?.locationMessage || msg.message?.liveLocationMessage;
+  if (loc?.degreesLatitude != null) {
+    writeJson('ubicacion.json', {
+      lat: loc.degreesLatitude,
+      lon: loc.degreesLongitude,
+      nombre: loc.name || loc.address || null,
+      en_vivo: Boolean(msg.message?.liveLocationMessage),
+      at: new Date().toISOString(),
+    });
+    log.info('Ubicación actualizada');
+    return;
+  }
   const text = textOf(msg.message);
   if (!text) {
     await sock.sendMessage(key.remoteJid, { text: 'Por ahora solo leo texto 🙏 (los audios y fotos sin texto todavía no).' });
@@ -231,6 +244,15 @@ app.all('/f', shortSecret, async (req, res) => {
 setInterval(() => {
   for (const [b, v] of batches) if (Date.now() - v.at > 3 * 3600e3) batches.delete(b);
 }, 3600e3);
+
+// Última ubicación que compartió Tomi por WhatsApp.
+app.all('/loc', requireSecret, (_req, res) => {
+  const u = readJson('ubicacion.json', null);
+  if (!u) return res.type('text/plain').send('SIN_UBICACION');
+  res.type('text/plain').send(
+    `LAT: ${u.lat}\nLON: ${u.lon}\nNOMBRE: ${u.nombre || '-'}\nEN_VIVO: ${u.en_vivo ? 'si' : 'no'}\nACTUALIZADA: ${local(u.at)}`
+  );
+});
 
 app.get('/qr', requireSecret, async (_req, res) => {
   const head = '<meta name="viewport" content="width=device-width"><meta http-equiv="refresh" content="10">';
