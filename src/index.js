@@ -194,7 +194,7 @@ app.all('/send', requireSecret, async (req, res) => {
 });
 
 // Envío en partes, para mensajes largos (la herramienta web de Claude limita el largo de la URL).
-//   /c?k=KEY&b=LOTE&n=1&t=texto   guarda la parte n del lote
+//   /c?k=KEY&b=LOTE&n=1&msg=texto   guarda la parte n del lote
 //   /f?k=KEY&b=LOTE               une las partes en orden y manda el mensaje
 const batches = new Map();
 const shortSecret = (req, res, next) => {
@@ -206,8 +206,8 @@ const shortSecret = (req, res, next) => {
 app.all('/c', shortSecret, (req, res) => {
   const b = String(param(req, 'b') || '');
   const n = Number(param(req, 'n'));
-  const t = param(req, 't');
-  if (!b || !Number.isInteger(n) || t === undefined) return res.status(400).send('Faltan b, n o t');
+  const t = param(req, 'msg') ?? param(req, 't');
+  if (!b || !Number.isInteger(n) || t === undefined) return res.status(400).send(`Faltan b, n o msg (recibí: ${Object.keys(req.query).join(',')})`);
   if (!batches.has(b)) batches.set(b, { parts: new Map(), at: Date.now() });
   batches.get(b).parts.set(n, String(t));
   res.type('text/plain').send(`OK parte ${n} del lote ${b} (${batches.get(b).parts.size} partes)`);
