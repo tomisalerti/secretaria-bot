@@ -130,6 +130,9 @@ async function startWhatsApp() {
     }
   });
   sock.ev.on('messages.upsert', async ({ messages, type }) => {
+    for (const m of messages) {
+      log.info({ type, from: m.key.remoteJid, alt: m.key.remoteJidAlt, fromMe: m.key.fromMe }, 'Mensaje recibido');
+    }
     if (type !== 'notify') return;
     for (const m of messages) await handleIncoming(m).catch((err) => log.error({ err }, 'Error procesando mensaje'));
   });
