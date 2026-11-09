@@ -16,6 +16,11 @@ import {
 import cron from 'node-cron';
 import { readJson, writeJson, dataPath } from './store.js';
 import { sendMail, startMailPoller, mailEnabled, deliveryEnabled } from './mail.js';
+import { startBuzon, buzonPut } from './buzon.js';
+
+// El canal por mail queda apagado salvo que se pida explícitamente (USE_MAIL=1).
+const USE_MAIL = process.env.USE_MAIL === '1';
+let buzon = null;
 
 const log = pino({ level: process.env.LOG_LEVEL || 'info' });
 const PORT = process.env.PORT || 3000;
@@ -99,6 +104,7 @@ async function handleIncoming(msg) {
       at: new Date().toISOString(),
     });
     log.info('Ubicación actualizada');
+    buzon?.publicarEstado().catch(() => {});
     return;
   }
   const text = textOf(msg.message);
@@ -108,7 +114,10 @@ async function handleIncoming(msg) {
   }
   const hadPending = readJson(INBOX, []).some((m) => m.status === 'nuevo');
   addToInbox(key.id, text);
-  if (deliveryEnabled) sendMail(`[WA-IN] ${text.replace(/\s+/g, ' ').slice(0, 60)}`, `${text}\n\n— Tomi por WhatsApp, ${local(new Date().toISOString())}`).catch(
+  buzonPut(`in:${Date.now()}`, `[${local(new Date().toISOString())}] ${text}`)
+    .then(() => buzonPut('estado:history', historyTexto()))
+    .catch((err) => log.error({ err: err.message }, 'No pude dejar el WhatsApp en el buzón'));
+  if (USE_MAIL && deliveryEnabled) sendMail(`[WA-IN] ${text.replace(/\s+/g, ' ').slice(0, 60)}`, `${text}\n\n— Tomi por WhatsApp, ${local(new Date().toISOString())}`).catch(
     (err) => log.error({ err: err.message }, 'No pude reenviar el WhatsApp por mail')
   );
   if (!hadPending) await sock.sendMessage(key.remoteJid, { text: ACK_TEXT });
@@ -137,7 +146,15 @@ async function startWhatsApp() {
       log.info('WhatsApp conectado');
       if (!mailPollerStarted) {
         mailPollerStarted = true;
-        startMailPoller((body) => sendToOwner(body), log);
+        if (USE_MAIL) startMailPoller((body) => sendToOwner(body), log);
+        buzon = startBuzon({
+          send: (t) => sendToOwner(t),
+          clima: () => climaTexto(),
+          impact: (o) => impactTexto(o),
+          history: () => historyTexto(),
+          connected: () => connected,
+          log,
+        });
       }
     }
     if (connection === 'close') {
@@ -194,14 +211,18 @@ app.all('/inbox', requireSecret, (req, res) => {
 });
 
 // Conversación reciente (mensajes de Tomi y respuestas enviadas), para tener contexto.
-app.all('/history', requireSecret, (_req, res) => {
+function historyTexto() {
   const items = [
     ...readJson(INBOX, []).map((m) => ({ at: m.at, who: 'Tomi', text: m.text })),
     ...readJson(OUTBOX, []).map((m) => ({ at: m.at, who: 'Secretaria', text: m.text })),
   ]
     .sort((a, b) => a.at.localeCompare(b.at))
     .slice(-30);
-  res.type('text/plain').send(items.map((i) => `[${local(i.at)}] ${i.who}: ${i.text}`).join('\n\n') || '(vacío)');
+  return items.map((i) => `[${local(i.at)}] ${i.who}: ${i.text}`).join('\n\n') || '(vacío)';
+}
+
+app.all('/history', requireSecret, (_req, res) => {
+  res.type('text/plain').send(historyTexto());
 });
 
 // Enviar un WhatsApp a Tomi.
