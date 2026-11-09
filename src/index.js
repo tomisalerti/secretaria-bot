@@ -110,6 +110,19 @@ async function handleIncoming(msg) {
   }
   let text = textOf(msg.message);
   let esAudio = false;
+  if (msg.message?.imageMessage) {
+    try {
+      const desc = await leerImagen(msg, msg.message.imageMessage.caption || '');
+      text = `🖼️ (imagen) ${msg.message.imageMessage.caption ? 'Tomi escribió: ' + msg.message.imageMessage.caption + '\nContenido de la imagen: ' : ''}${desc}`;
+      await sock.sendMessage(key.remoteJid, { text: '🖼️ Recibí la imagen, la leo en la próxima revisión.' });
+    } catch (err) {
+      log.error({ err: err.message }, 'No pude leer la imagen');
+      if (!text) {
+        await sock.sendMessage(key.remoteJid, { text: 'No pude leer la imagen 😕 ¿Me escribís lo que tiene?' });
+        return;
+      }
+    }
+  }
   if (!text && msg.message?.audioMessage) {
     try {
       const transcripcion = await transcribir(msg);
@@ -123,7 +136,7 @@ async function handleIncoming(msg) {
     }
   }
   if (!text) {
-    await sock.sendMessage(key.remoteJid, { text: 'Por ahora leo texto y audios 🙏 (fotos sin texto todavía no).' });
+    await sock.sendMessage(key.remoteJid, { text: 'Por ahora leo texto, audios e imágenes 🙏' });
     return;
   }
   const hadPending = readJson(INBOX, []).some((m) => m.status === 'nuevo');
@@ -139,6 +152,46 @@ async function handleIncoming(msg) {
     (err) => log.error({ err: err.message }, 'No pude reenviar el WhatsApp por mail')
   );
   if (!hadPending) await sock.sendMessage(key.remoteJid, { text: ACK_TEXT });
+}
+
+// Lee imágenes (flyers, capturas) con un modelo de visión de Groq y devuelve texto.
+const VISION_MODELS = (process.env.GROQ_VISION_MODEL || 'meta-llama/llama-4-scout-17b-16e-instruct,meta-llama/llama-4-maverick-17b-128e-instruct').split(',');
+async function leerImagen(msg, caption) {
+  if (!process.env.GROQ_API_KEY) throw new Error('Falta GROQ_API_KEY');
+  const buf = await downloadMediaMessage(msg, 'buffer', {}, { logger: log, reuploadRequest: sock.updateMediaMessage });
+  const mime = msg.message.imageMessage.mimetype || 'image/jpeg';
+  const dataUrl = `data:${mime};base64,${buf.toString('base64')}`;
+  const prompt =
+    'Sos un asistente que lee imágenes para una secretaria. Respondé en español.\n' +
+    '1) Transcribí TODO el texto visible, tal cual (nombres, fechas, horarios, direcciones, precios, links, @usuarios).\n' +
+    '2) Si es un flyer o invitación de un evento, resumí: nombre, fecha, hora, lugar, organizador, precio o forma de entrar, links o QR.\n' +
+    '3) Si es otra cosa (captura de chat, mail, ticket, foto), describila en 2 o 3 líneas.\n' +
+    (caption ? `Tomi la mandó con este texto: "${caption}"\n` : '');
+  let lastErr;
+  for (const model of VISION_MODELS) {
+    try {
+      const r = await fetch('https://api.groq.com/openai/v1/chat/completions', {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${process.env.GROQ_API_KEY}`, 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          model: model.trim(),
+          temperature: 0.1,
+          max_tokens: 1200,
+          messages: [{ role: 'user', content: [{ type: 'text', text: prompt }, { type: 'image_url', image_url: { url: dataUrl } }] }],
+        }),
+        signal: AbortSignal.timeout(60000),
+      });
+      const body = await r.text();
+      if (!r.ok) throw new Error(`Groq ${model} ${r.status}: ${body.slice(0, 200)}`);
+      const out = JSON.parse(body).choices?.[0]?.message?.content?.trim();
+      if (out) return out;
+      throw new Error('respuesta vacía');
+    } catch (err) {
+      lastErr = err;
+      log.warn({ err: err.message }, 'Modelo de visión falló, pruebo el siguiente');
+    }
+  }
+  throw lastErr;
 }
 
 // Transcribe audios de WhatsApp con Whisper (Groq).
