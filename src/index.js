@@ -13,7 +13,9 @@ import {
   Browsers,
   isJidGroup,
 } from '@whiskeysockets/baileys';
+import cron from 'node-cron';
 import { readJson, writeJson, dataPath } from './store.js';
+import { sendMail, startMailPoller, mailEnabled } from './mail.js';
 
 const log = pino({ level: process.env.LOG_LEVEL || 'info' });
 const PORT = process.env.PORT || 3000;
@@ -31,6 +33,7 @@ if (!ADMIN_SECRET || !OWNER) log.error('Faltan ADMIN_SECRET u OWNER_NUMBER en la
 let sock = null;
 let lastQr = null;
 let connected = false;
+let mailPollerStarted = false;
 let ownerChat = readJson('owner-chat.json', null); // jid real del chat con Tomi (puede ser un LID)
 
 // ---------------- Bandeja ----------------
@@ -105,6 +108,9 @@ async function handleIncoming(msg) {
   }
   const hadPending = readJson(INBOX, []).some((m) => m.status === 'nuevo');
   addToInbox(key.id, text);
+  sendMail(`[WA-IN] ${text.replace(/\s+/g, ' ').slice(0, 60)}`, `${text}\n\n— Tomi por WhatsApp, ${local(new Date().toISOString())}`).catch(
+    (err) => log.error({ err: err.message }, 'No pude reenviar el WhatsApp por mail')
+  );
   if (!hadPending) await sock.sendMessage(key.remoteJid, { text: ACK_TEXT });
 }
 
@@ -129,6 +135,10 @@ async function startWhatsApp() {
       connected = true;
       lastQr = null;
       log.info('WhatsApp conectado');
+      if (!mailPollerStarted) {
+        mailPollerStarted = true;
+        startMailPoller((body) => sendToOwner(body), log);
+      }
     }
     if (connection === 'close') {
       connected = false;
@@ -272,8 +282,8 @@ const WMO = {
   80: 'chaparrones', 81: 'chaparrones', 82: 'chaparrones fuertes', 95: 'tormenta', 96: 'tormenta con granizo', 99: 'tormenta con granizo',
 };
 
-app.all('/clima', requireSecret, async (_req, res) => {
-  try {
+async function climaTexto() {
+  {
     const u = readJson('ubicacion.json', null);
     const fresh = u && Date.now() - new Date(u.at).getTime() < 36 * 3600e3;
     const lat = fresh ? u.lat : -34.9011;
@@ -298,7 +308,7 @@ app.all('/clima', requireSecret, async (_req, res) => {
       const probs = h.precipitation_probability.slice(from, to);
       return Math.max(...probs);
     };
-    res.type('text/plain').send(
+    return (
       [
         `UBICACION: ${lugar}${fresh ? (u.en_vivo ? ' (ubicación en tiempo real)' : ' (última ubicación compartida)') : ' (por defecto: no compartió ubicación en las últimas 36 h)'}`,
         `TEMPERATURA_AHORA: ${Math.round(w.current.temperature_2m)} °C, ${WMO[w.current.weather_code] || 'código ' + w.current.weather_code}`,
@@ -306,6 +316,12 @@ app.all('/clima', requireSecret, async (_req, res) => {
         `PROBABILIDAD_DE_LLUVIA: mañana (6-12 h) ${tramo(6, 12)}%, tarde (12-19 h) ${tramo(12, 19)}%, noche (19-24 h) ${tramo(19, 24)}%`,
       ].join('\n')
     );
+  }
+}
+
+app.all('/clima', requireSecret, async (_req, res) => {
+  try {
+    res.type('text/plain').send(await climaTexto());
   } catch (err) {
     res.status(502).type('text/plain').send(`ERROR_CLIMA: ${err.message}`);
   }
@@ -355,10 +371,10 @@ async function impactActions(days) {
   return out;
 }
 
-app.all('/impact', requireSecret, async (req, res) => {
-  if (!IMPACT_SID || !IMPACT_TOKEN) return res.type('text/plain').send('IMPACT_NO_CONFIGURADO');
-  try {
-    const filtro = String(param(req, 'campana') || 'holafly').toLowerCase();
+async function impactTexto({ filtro = 'holafly', mark = false, debug = false } = {}) {
+  if (!IMPACT_SID || !IMPACT_TOKEN) return 'IMPACT_NO_CONFIGURADO';
+  {
+    filtro = String(filtro).toLowerCase();
     const all = await impactActions(365);
     const actions = all.filter(
       (a) => filtro === 'todas' || String(a.CampaignName || '').toLowerCase().includes(filtro)
@@ -368,7 +384,7 @@ app.all('/impact', requireSecret, async (req, res) => {
     const nuevas = valid.filter((a) => !seen.has(String(a.Id)));
     const sum = (list, f) => list.reduce((s, a) => s + num(a[f]), 0);
     const cur = valid[0]?.Currency || 'USD';
-    if (param(req, 'mark') === '1') writeJson('impact-seen.json', valid.map((a) => String(a.Id)));
+    if (mark) writeJson('impact-seen.json', valid.map((a) => String(a.Id)));
     const lines = [
       `CAMPANA_FILTRO: ${filtro}`,
       `MONEDA: ${cur}`,
@@ -380,12 +396,24 @@ app.all('/impact', requireSecret, async (req, res) => {
       `REVENUE_NUEVO: ${sum(nuevas, 'Amount').toFixed(2)}`,
       `PRIMER_AVISO: ${seen.size === 0 ? 'si (todas cuentan como nuevas)' : 'no'}`,
     ];
-    if (param(req, 'debug') === '1') {
+    if (debug) {
       lines.push(`ACCIONES_TOTALES_TODAS_LAS_CAMPANAS: ${all.length}`);
       lines.push(`CAMPANAS: ${[...new Set(all.map((a) => a.CampaignName))].join(' | ')}`);
       if (all[0]) lines.push(`EJEMPLO: ${JSON.stringify(all[0]).slice(0, 800)}`);
     }
-    res.type('text/plain').send(lines.join('\n'));
+    return lines.join('\n');
+  }
+}
+
+app.all('/impact', requireSecret, async (req, res) => {
+  try {
+    res.type('text/plain').send(
+      await impactTexto({
+        filtro: param(req, 'campana') || 'holafly',
+        mark: param(req, 'mark') === '1',
+        debug: param(req, 'debug') === '1',
+      })
+    );
   } catch (err) {
     res.status(502).type('text/plain').send(`ERROR_IMPACT: ${err.message}`);
   }
@@ -402,6 +430,36 @@ app.get('/qr', requireSecret, async (_req, res) => {
       `<p>WhatsApp → Dispositivos vinculados → Vincular un dispositivo</p><img src="${img}" alt="QR"/>` +
       `<p>La página se actualiza cada 10 segundos.</p></div>`
   );
+});
+
+// ---------------- Datos de la mañana por mail ----------------
+async function mandarDatos() {
+  const partes = [];
+  try {
+    partes.push('== CLIMA ==\n' + (await climaTexto()));
+  } catch (err) {
+    partes.push('== CLIMA ==\nERROR_CLIMA: ' + err.message);
+  }
+  try {
+    partes.push('== HOLAFLY (IMPACT) ==\n' + (await impactTexto({ mark: true })));
+  } catch (err) {
+    partes.push('== HOLAFLY (IMPACT) ==\nERROR_IMPACT: ' + err.message);
+  }
+  partes.push(`== WHATSAPP ==\n${connected ? 'conectado' : 'DESCONECTADO'}`);
+  const hoy = new Date().toLocaleDateString('es-UY', { timeZone: TZ });
+  await sendMail(`[DATOS] Mañana ${hoy}`, partes.join('\n\n'));
+  log.info('Datos de la mañana enviados por mail');
+}
+
+cron.schedule(process.env.DATOS_CRON || '20 8 * * *', () => mandarDatos().catch((e) => log.error(e)), { timezone: TZ });
+
+app.all('/datos', requireSecret, async (_req, res) => {
+  try {
+    await mandarDatos();
+    res.type('text/plain').send(mailEnabled ? 'DATOS_ENVIADOS' : 'MAIL_NO_CONFIGURADO');
+  } catch (err) {
+    res.status(500).type('text/plain').send(err.message);
+  }
 });
 
 app.listen(PORT, () => log.info(`Servidor en puerto ${PORT}`));

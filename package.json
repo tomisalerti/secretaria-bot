@@ -13,6 +13,10 @@
   "dependencies": {
     "@whiskeysockets/baileys": "7.0.0-rc14",
     "express": "^4.21.2",
+    "imapflow": "^2.11.0",
+    "mailparser": "^3.14.2",
+    "node-cron": "^4.6.0",
+    "nodemailer": "^10.4.0",
     "pino": "^9.6.0",
     "qrcode": "^1.5.4"
   }
