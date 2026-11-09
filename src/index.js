@@ -12,6 +12,7 @@ import {
   fetchLatestBaileysVersion,
   Browsers,
   isJidGroup,
+  downloadMediaMessage,
 } from '@whiskeysockets/baileys';
 import cron from 'node-cron';
 import { readJson, writeJson, dataPath } from './store.js';
@@ -107,13 +108,30 @@ async function handleIncoming(msg) {
     buzon?.publicarEstado().catch(() => {});
     return;
   }
-  const text = textOf(msg.message);
+  let text = textOf(msg.message);
+  let esAudio = false;
+  if (!text && msg.message?.audioMessage) {
+    try {
+      const transcripcion = await transcribir(msg);
+      if (!transcripcion) throw new Error('transcripción vacía');
+      text = `🎤 (audio) ${transcripcion}`;
+      esAudio = true;
+    } catch (err) {
+      log.error({ err: err.message }, 'No pude transcribir el audio');
+      await sock.sendMessage(key.remoteJid, { text: 'No pude entender el audio 😕 ¿Me lo mandás de nuevo o por escrito?' });
+      return;
+    }
+  }
   if (!text) {
-    await sock.sendMessage(key.remoteJid, { text: 'Por ahora solo leo texto 🙏 (los audios y fotos sin texto todavía no).' });
+    await sock.sendMessage(key.remoteJid, { text: 'Por ahora leo texto y audios 🙏 (fotos sin texto todavía no).' });
     return;
   }
   const hadPending = readJson(INBOX, []).some((m) => m.status === 'nuevo');
   addToInbox(key.id, text);
+  if (esAudio) {
+    const t = text.replace('🎤 (audio) ', '');
+    await sock.sendMessage(key.remoteJid, { text: `🎤 Entendí: «${t.length > 400 ? t.slice(0, 400) + '…' : t}»` });
+  }
   buzonPut(`in:${Date.now()}`, `[${local(new Date().toISOString())}] ${text}`)
     .then(() => buzonPut('estado:history', historyTexto()))
     .catch((err) => log.error({ err: err.message }, 'No pude dejar el WhatsApp en el buzón'));
@@ -121,6 +139,26 @@ async function handleIncoming(msg) {
     (err) => log.error({ err: err.message }, 'No pude reenviar el WhatsApp por mail')
   );
   if (!hadPending) await sock.sendMessage(key.remoteJid, { text: ACK_TEXT });
+}
+
+// Transcribe audios de WhatsApp con Whisper (Groq).
+async function transcribir(msg) {
+  if (!process.env.GROQ_API_KEY) throw new Error('Falta GROQ_API_KEY');
+  const buf = await downloadMediaMessage(msg, 'buffer', {}, { logger: log, reuploadRequest: sock.updateMediaMessage });
+  const form = new FormData();
+  form.append('file', new Blob([buf], { type: 'audio/ogg' }), 'audio.ogg');
+  form.append('model', process.env.GROQ_MODEL || 'whisper-large-v3');
+  form.append('language', 'es');
+  form.append('response_format', 'json');
+  const r = await fetch('https://api.groq.com/openai/v1/audio/transcriptions', {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${process.env.GROQ_API_KEY}` },
+    body: form,
+    signal: AbortSignal.timeout(60000),
+  });
+  const body = await r.text();
+  if (!r.ok) throw new Error(`Groq ${r.status}: ${body.slice(0, 200)}`);
+  return (JSON.parse(body).text || '').trim();
 }
 
 async function startWhatsApp() {
