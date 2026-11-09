@@ -15,7 +15,7 @@ import {
 } from '@whiskeysockets/baileys';
 import cron from 'node-cron';
 import { readJson, writeJson, dataPath } from './store.js';
-import { sendMail, startMailPoller, mailEnabled } from './mail.js';
+import { sendMail, startMailPoller, mailEnabled, deliveryEnabled } from './mail.js';
 
 const log = pino({ level: process.env.LOG_LEVEL || 'info' });
 const PORT = process.env.PORT || 3000;
@@ -108,7 +108,7 @@ async function handleIncoming(msg) {
   }
   const hadPending = readJson(INBOX, []).some((m) => m.status === 'nuevo');
   addToInbox(key.id, text);
-  sendMail(`[WA-IN] ${text.replace(/\s+/g, ' ').slice(0, 60)}`, `${text}\n\n— Tomi por WhatsApp, ${local(new Date().toISOString())}`).catch(
+  if (deliveryEnabled) sendMail(`[WA-IN] ${text.replace(/\s+/g, ' ').slice(0, 60)}`, `${text}\n\n— Tomi por WhatsApp, ${local(new Date().toISOString())}`).catch(
     (err) => log.error({ err: err.message }, 'No pude reenviar el WhatsApp por mail')
   );
   if (!hadPending) await sock.sendMessage(key.remoteJid, { text: ACK_TEXT });
@@ -451,7 +451,10 @@ async function mandarDatos() {
   log.info('Datos de la mañana enviados por mail');
 }
 
-cron.schedule(process.env.DATOS_CRON || '20 8 * * *', () => mandarDatos().catch((e) => log.error(e)), { timezone: TZ });
+// Solo si el bot puede dejar mails en la casilla de Tomi (si no, no marcaría ventas como vistas).
+if (deliveryEnabled) {
+  cron.schedule(process.env.DATOS_CRON || '20 8 * * *', () => mandarDatos().catch((e) => log.error(e)), { timezone: TZ });
+}
 
 app.all('/datos', requireSecret, async (_req, res) => {
   try {
