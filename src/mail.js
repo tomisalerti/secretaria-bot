@@ -1,42 +1,69 @@
 // Canal por mail entre el bot y la secretaria (Claude), para no depender de links.
-//  - El bot le manda a Tomi (OWNER_EMAIL) los WhatsApp que él escribe y los datos de la mañana.
-//  - Claude le manda mails a la casilla del bot (BOT_EMAIL) con asunto "[WA <clave>]";
-//    el bot los lee por IMAP, manda el cuerpo por WhatsApp y borra el mail.
-import nodemailer from 'nodemailer';
+//  - Hacia Claude: el bot DEPOSITA los mensajes (WhatsApp de Tomi, datos de la mañana) por IMAP
+//    en la etiqueta "Secretaria" de la casilla de Tomi (Railway bloquea SMTP, IMAP sí funciona).
+//  - Desde Claude: Claude manda un mail a la casilla del bot (BOT_EMAIL) con la clave en el asunto;
+//    el bot lo lee por IMAP, manda el cuerpo por WhatsApp y borra el mail.
 import { ImapFlow } from 'imapflow';
 import { simpleParser } from 'mailparser';
 
 const BOT_EMAIL = process.env.BOT_EMAIL;
 const BOT_EMAIL_PASS = (process.env.BOT_EMAIL_PASS || '').replace(/\s/g, '');
-export const OWNER_EMAIL = process.env.OWNER_EMAIL || 'tomi+secretaria@ruffiweb.com';
+const OWNER_IMAP_USER = process.env.OWNER_IMAP_USER; // ej. tomi@ruffiweb.com
+const OWNER_IMAP_PASS = (process.env.OWNER_IMAP_PASS || '').replace(/\s/g, '');
+const OWNER_FOLDER = process.env.OWNER_FOLDER || 'Secretaria';
 const MAIL_KEY = process.env.MAIL_KEY || process.env.ADMIN_SECRET;
 const ALLOWED_FROM = (process.env.MAIL_ALLOWED_FROM || 'tomi@ruffiweb.com').toLowerCase().split(',');
 
 export const mailEnabled = Boolean(BOT_EMAIL && BOT_EMAIL_PASS);
+export const deliveryEnabled = Boolean(OWNER_IMAP_USER && OWNER_IMAP_PASS);
 
-let transport = null;
-function smtp() {
-  if (!transport) {
-    transport = nodemailer.createTransport({
-      host: 'smtp.gmail.com',
-      port: 465,
-      secure: true,
-      auth: { user: BOT_EMAIL, pass: BOT_EMAIL_PASS },
-    });
-  }
-  return transport;
+const withTimeout = (p, ms, what) =>
+  Promise.race([p, new Promise((_, rej) => setTimeout(() => rej(new Error(`timeout: ${what}`)), ms))]);
+
+function imap(user, pass) {
+  return new ImapFlow({ host: 'imap.gmail.com', port: 993, secure: true, auth: { user, pass }, logger: false });
 }
 
+function encodeHeader(v) {
+  return /[^\x00-\x7F]/.test(v) ? `=?UTF-8?B?${Buffer.from(v).toString('base64')}?=` : v;
+}
+
+/** Deja un mensaje sin leer en la etiqueta "Secretaria" de la casilla de Tomi. */
 export async function sendMail(subject, text) {
-  if (!mailEnabled) return;
-  await smtp().sendMail({ from: `Secretaria WhatsApp <${BOT_EMAIL}>`, to: OWNER_EMAIL, subject, text });
+  if (!deliveryEnabled) throw new Error('Falta OWNER_IMAP_USER u OWNER_IMAP_PASS');
+  const raw = [
+    `From: Secretaria WhatsApp <${BOT_EMAIL || OWNER_IMAP_USER}>`,
+    `To: ${OWNER_IMAP_USER}`,
+    `Subject: ${encodeHeader(subject)}`,
+    `Date: ${new Date().toUTCString()}`,
+    `Message-ID: <${Date.now()}.${Math.random().toString(36).slice(2)}@secretaria-bot>`,
+    'MIME-Version: 1.0',
+    'Content-Type: text/plain; charset=UTF-8',
+    'Content-Transfer-Encoding: base64',
+    '',
+    Buffer.from(text).toString('base64').replace(/.{76}/g, '$&\r\n'),
+  ].join('\r\n');
+  const client = imap(OWNER_IMAP_USER, OWNER_IMAP_PASS);
+  try {
+    await withTimeout(client.connect(), 20000, 'conectar casilla de Tomi');
+    try {
+      await client.mailboxCreate(OWNER_FOLDER);
+    } catch {
+      /* ya existe */
+    }
+    await withTimeout(client.append(OWNER_FOLDER, raw, [], new Date()), 20000, 'depositar mail');
+    await client.logout();
+  } catch (err) {
+    try {
+      client.close();
+    } catch {}
+    throw err;
+  }
 }
 
-// Quita del cuerpo lo citado de mails anteriores y firmas típicas.
 function cleanBody(text) {
-  const lines = (text || '').replace(/\r/g, '').split('\n');
   const out = [];
-  for (const l of lines) {
+  for (const l of (text || '').replace(/\r/g, '').split('\n')) {
     if (/^On .+wrote:$/.test(l) || /^El .+escribió:$/.test(l) || /^-{2,}\s*Original/.test(l)) break;
     if (l.startsWith('>')) continue;
     out.push(l);
@@ -44,40 +71,28 @@ function cleanBody(text) {
   return out.join('\n').trim();
 }
 
-/**
- * Revisa la casilla del bot cada `everyMs` y llama a onMessage(texto) por cada mail válido.
- * Si onMessage tira error, el mail queda sin leer para reintentar.
- */
+/** Revisa la casilla del bot y manda por WhatsApp cada mail válido de Claude. */
 export function startMailPoller(onMessage, log, everyMs = 20000) {
   if (!mailEnabled) {
     log.warn('Canal por mail desactivado: faltan BOT_EMAIL o BOT_EMAIL_PASS');
     return;
   }
   let running = false;
-  const tick = async () => {
-    if (running) return;
-    running = true;
-    const client = new ImapFlow({
-      host: 'imap.gmail.com',
-      port: 993,
-      secure: true,
-      auth: { user: BOT_EMAIL, pass: BOT_EMAIL_PASS },
-      logger: false,
-    });
+  const work = async () => {
+    const client = imap(BOT_EMAIL, BOT_EMAIL_PASS);
     try {
       await client.connect();
       const lock = await client.getMailboxLock('INBOX');
       try {
-        const uids = await client.search({ seen: false, subject: '[WA' }, { uid: true });
-        for (const uid of uids || []) {
+        // Buscar por la clave (texto único) evita tocar cualquier otro mail de la casilla.
+        const uids = (await client.search({ seen: false, subject: MAIL_KEY }, { uid: true })) || [];
+        for (const uid of uids) {
           const msg = await client.fetchOne(uid, { source: true }, { uid: true });
           const mail = await simpleParser(msg.source);
           const from = (mail.from?.value?.[0]?.address || '').toLowerCase();
-          const subject = mail.subject || '';
-          const okKey = MAIL_KEY && subject.includes(MAIL_KEY);
-          if (!ALLOWED_FROM.includes(from) || !okKey) {
-            log.warn({ from, subject: subject.slice(0, 40) }, 'Mail ignorado (remitente o clave inválidos)');
-            await client.messageFlagsAdd(uid, ['\\Seen'], { uid: true });
+          if (!ALLOWED_FROM.includes(from)) {
+            log.warn({ from }, 'Mail con clave pero de remitente no permitido: lo borro');
+            await client.messageDelete(uid, { uid: true });
             continue;
           }
           const body = cleanBody(mail.text || '');
@@ -90,10 +105,19 @@ export function startMailPoller(onMessage, log, everyMs = 20000) {
       }
       await client.logout();
     } catch (err) {
-      log.error({ err: err.message }, 'Error revisando la casilla del bot');
       try {
-        await client.close();
+        client.close();
       } catch {}
+      throw err;
+    }
+  };
+  const tick = async () => {
+    if (running) return;
+    running = true;
+    try {
+      await withTimeout(work(), 90000, 'revisar casilla del bot');
+    } catch (err) {
+      log.error({ err: err.message }, 'Error revisando la casilla del bot');
     } finally {
       running = false;
     }
