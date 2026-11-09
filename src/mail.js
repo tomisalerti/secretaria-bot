@@ -78,14 +78,37 @@ export function startMailPoller(onMessage, log, everyMs = 20000) {
     return;
   }
   let running = false;
+  let firstTickLogged = false;
   const work = async () => {
     const client = imap(BOT_EMAIL, BOT_EMAIL_PASS);
     try {
       await client.connect();
+      // Si Gmail mandó algún mail de Claude a Spam, lo devuelvo a la bandeja de entrada.
+      try {
+        const junk = (await client.list()).find((b) => b.specialUse === '\\Junk');
+        if (junk) {
+          const l2 = await client.getMailboxLock(junk.path);
+          try {
+            const spam = (await client.search({ subject: MAIL_KEY }, { uid: true })) || [];
+            if (spam.length) {
+              await client.messageMove(spam, 'INBOX', { uid: true });
+              log.info({ n: spam.length }, 'Mails de Claude rescatados de Spam');
+            }
+          } finally {
+            l2.release();
+          }
+        }
+      } catch (err) {
+        log.warn({ err: err.message }, 'No pude revisar Spam');
+      }
       const lock = await client.getMailboxLock('INBOX');
       try {
         // Buscar por la clave (texto único) evita tocar cualquier otro mail de la casilla.
         const uids = (await client.search({ seen: false, subject: MAIL_KEY }, { uid: true })) || [];
+        if (!firstTickLogged) {
+          firstTickLogged = true;
+          log.info({ pendientes: uids.length }, 'Casilla del bot revisada por primera vez');
+        }
         for (const uid of uids) {
           const msg = await client.fetchOne(uid, { source: true }, { uid: true });
           const mail = await simpleParser(msg.source);
