@@ -17,7 +17,7 @@ import {
 import cron from 'node-cron';
 import { readJson, writeJson, dataPath } from './store.js';
 import { sendMail, startMailPoller, mailEnabled, deliveryEnabled } from './mail.js';
-import { startBuzon, buzonPut } from './buzon.js';
+import { startBuzon, buzonPut, buzonAgregarEntrada } from './buzon.js';
 
 // El canal por mail queda apagado salvo que se pida explícitamente (USE_MAIL=1).
 const USE_MAIL = process.env.USE_MAIL === '1';
@@ -145,7 +145,7 @@ async function handleIncoming(msg) {
     const t = text.replace('🎤 (audio) ', '');
     await sock.sendMessage(key.remoteJid, { text: `🎤 Entendí: «${t.length > 400 ? t.slice(0, 400) + '…' : t}»` });
   }
-  buzonPut(`in:${Date.now()}`, `[${local(new Date().toISOString())}] ${text}`)
+  buzonAgregarEntrada(text, local(new Date().toISOString()))
     .then(() => buzonPut('estado:history', historyTexto()))
     .catch((err) => log.error({ err: err.message }, 'No pude dejar el WhatsApp en el buzón'));
   if (USE_MAIL && deliveryEnabled) sendMail(`[WA-IN] ${text.replace(/\s+/g, ' ').slice(0, 60)}`, `${text}\n\n— Tomi por WhatsApp, ${local(new Date().toISOString())}`).catch(
